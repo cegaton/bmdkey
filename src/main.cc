@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <signal.h>
 #include <exception>
 #include <vector>
 #include <set>
@@ -15,7 +16,7 @@
 #include <X11/Xatom.h>
 
 #define MAX_STR 255
-#define WHEEL_STEP 30000
+#define WHEEL_STEP 12000
 #define TIMEOUT_MS (60 * 1000)
 
 static Display* display;
@@ -25,8 +26,14 @@ static std::set<uint16_t> currentKeyboardState;
 static int minKeycode;
 static int maxKeycode;
 static int lastModifiedKey = 0;
+static bool running = true;
 
-static const std::vector<KeySym> MODIFIERS = {XK_Alt_L, XK_Meta_L, XK_Super_L};
+void signalHandler(int)
+{
+    running = false;
+}
+
+static const std::vector<KeySym> MODIFIERS = {};
 
 static const std::map<int, std::pair<KeySym, bool>> KEYMAP = {
     {0x01, {XK_F1, false} }, /* SMART INSRT */
@@ -35,8 +42,8 @@ static const std::map<int, std::pair<KeySym, bool>> KEYMAP = {
     {0x04, {XK_F4, false} }, /* CLOSE UP */
     {0x05, {XK_F5, false} }, /* PLACE ON TOP */
     {0x06, {XK_F6, false} }, /* SRC O/WR */
-    {0x07, {XK_F7, false} }, /* IN */
-    {0x08, {XK_F8, false} }, /* OUT */
+    {0x07, {XK_i, false} }, /* IN */
+    {0x08, {XK_o, false} }, /* OUT */
     {0x09, {XK_F9, false} }, /* TRIM IN */
     {0x0a, {XK_F10, false}}, /* TRIM OUT */
     {0x0b, {XK_F11, false}}, /* ROLL */
@@ -49,8 +56,8 @@ static const std::map<int, std::pair<KeySym, bool>> KEYMAP = {
 
     {0x1a, {XK_F18, false}}, /* SOURCE */
     {0x1b, {XK_F19, false}}, /* TIMELINE */
-    {0x1c, {XK_F20, false}}, /* SHTL */
-    {0x1d, {XK_F21, false}}, /* JOG */
+    {0x1c, {XK_Left, false}}, /* SHTL */
+    {0x1d, {XK_Right, false}}, /* JOG */
     {0x1e, {XK_F22, false}}, /* SCRL */
 
     {0x31, {XK_F1, true}  }, /* ESC */
@@ -74,7 +81,7 @@ static const std::map<int, std::pair<KeySym, bool>> KEYMAP = {
     {0x2c, {XK_F19, true} }, /* LIVE O/WR */
     {0x25, {XK_F20, true} }, /* VIDEO ONLY */
     {0x26, {XK_F21, true} }, /* AUDIO ONLY */
-    {0x3c, {XK_F22, true} }, /* STOP/PLAY */
+    {0x3c, {XK_space, false} }, /* STOP/PLAY */
 };
 
 static void checkerror(int res)
@@ -310,6 +317,9 @@ static void pressReleaseModifiers(bool pressed)
 
 int main()
 {
+    
+    signal(SIGINT, signalHandler);
+    signal(SIGTERM, signalHandler);
     display = XOpenDisplay(nullptr);
     window = XDefaultRootWindow(display);
     fakekey = fakekey_init(display);
@@ -333,7 +343,7 @@ int main()
         int32_t sentWheelPosition = 0;
         int32_t wheelPosition = 0;
         int msTimeout = TIMEOUT_MS;
-        for (;;)
+        while (running)
         {
             try
             {
@@ -352,21 +362,45 @@ int main()
                         /* wheel packet */
                         int32_t delta = getInt32(&data[2]);
                         wheelPosition += delta;
+                    
                         for (;;)
                         {
                             int32_t totalDelta =
                                 wheelPosition - sentWheelPosition;
+                    
                             if (abs(totalDelta) < WHEEL_STEP)
                                 break;
-
-                            int button = (totalDelta < 0) ? 4 : 5;
+                    
+                            KeySym keysym =
+                                (totalDelta < 0) ? XK_Left : XK_Right;
+                    
+                            KeyCode code =
+                                XKeysymToKeycode(display, keysym);
+                    
+                            /* key press */
+                            fakekey_send_keyevent(
+                                fakekey,
+                                code,
+                                true,
+                                0);
+                    
+                            XSync(display, false);
+                    
+                            /* key release */
+                            fakekey_send_keyevent(
+                                fakekey,
+                                code,
+                                false,
+                                0);
+                    
+                            XSync(display, false);
+                    
                             sentWheelPosition +=
-                                (totalDelta < 0) ? -WHEEL_STEP : WHEEL_STEP;
-                            XTestFakeButtonEvent(display, button, true, 0);
-                            XSync(display, false);
-                            XTestFakeButtonEvent(display, button, false, 0);
-                            XSync(display, false);
+                                (totalDelta < 0)
+                                    ? -WHEEL_STEP
+                                    : WHEEL_STEP;
                         }
+                    
                         break;
                     }
 
