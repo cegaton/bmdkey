@@ -1,0 +1,101 @@
+# bmdkey configuration
+#
+# This file is reloaded automatically whenever you save it, so there's no need
+# to restart bmdkey. Send it SIGHUP to force a reload.
+#
+# ACTIONS (the value after the '=')
+#   none                      do nothing
+#   i   F13   space   Left    a single key (X keysym names; case matters for
+#                             letters: 'B' sends shift+b)
+#   ctrl+shift+z              key combo. Modifiers: ctrl shift alt super altgr
+#   scroll_up  scroll_down    mouse wheel (also scroll_left / scroll_right)
+#   click_left click_right    mouse buttons (also click_middle, buttonN)
+#   ctrl+scroll_up            modifiers work with mouse actions too
+#   ctrl+c, ctrl+v            a sequence: comma-separated, played in order
+#   exec:notify-send hello    run a shell command
+#
+# A single key combo or mouse click is held for as long as you hold the Speed
+# Editor key (so auto-repeat and click-and-drag work). Sequences, scrolls and
+# exec: fire once when the key is pressed.
+#
+# Comments must be on their own line, starting with # or ;
+#
+# KEY NAMES (as printed on the Speed Editor; run 'bmdkey --learn' to see them):
+#   SMART_INSRT APPEND RIPL_OWR CLOSE_UP PLACE_ON_TOP SRC_OWR
+#   IN OUT TRIM_IN TRIM_OUT ROLL SLIP_SRC SLIP_DEST TRANS_DUR
+#   CUT DIS SMTH_CUT SOURCE TIMELINE
+#   ESC SYNC_BIN AUDIO_LEVEL FULL_VIEW TRANS SPLIT SNAP RIPL_DEL
+#   CAM1 .. CAM9 LIVE_OWR VIDEO_ONLY AUDIO_ONLY STOP_PLAY
+#
+# SHTL, JOG and SCRL are reserved: they switch the wheel between the three
+# [wheel.*] sections below, and light up to show which one is active.
+
+[general]
+# Wheel mode at startup: jog, shtl or scrl
+default_mode = jog
+# Light the LEDs on the keys that have them (CUT, DIS, CAM1..9, ...)
+key_leds = on
+# Pause between the steps of a sequence, in milliseconds
+sequence_delay_ms = 10
+
+[keys]
+SMART_INSRT  = F1
+APPEND       = F2
+RIPL_OWR     = F3
+CLOSE_UP     = F4
+PLACE_ON_TOP = F5
+SRC_OWR      = F6
+IN           = i
+OUT          = o
+TRIM_IN      = F9
+TRIM_OUT     = F10
+ROLL         = F11
+SLIP_SRC     = F12
+SLIP_DEST    = F13
+TRANS_DUR    = F14
+CUT          = F15
+DIS          = F16
+SMTH_CUT     = F17
+SOURCE       = F18
+TIMELINE     = F19
+
+ESC          = shift+F1
+SYNC_BIN     = shift+F2
+AUDIO_LEVEL  = shift+F3
+FULL_VIEW    = shift+F4
+TRANS        = shift+F5
+SPLIT        = shift+F6
+SNAP         = shift+F7
+RIPL_DEL     = shift+F8
+
+CAM1         = shift+F10
+CAM2         = shift+F11
+CAM3         = shift+F12
+CAM4         = shift+F13
+CAM5         = shift+F14
+CAM6         = shift+F15
+CAM7         = shift+F16
+CAM8         = shift+F17
+CAM9         = shift+F18
+LIVE_OWR     = shift+F19
+VIDEO_ONLY   = shift+F20
+AUDIO_ONLY   = shift+F21
+STOP_PLAY    = space
+
+# Each wheel mode: 'step' is how far the wheel turns (in device units) per
+# action; smaller = more actions per turn. 12000 is roughly 30 per revolution.
+
+[wheel.jog]
+step  = 12000
+left  = Left
+right = Right
+
+[wheel.shtl]
+step  = 3000
+left  = Left
+right = Right
+
+[wheel.scrl]
+step  = 6000
+left  = scroll_up
+right = scroll_down
