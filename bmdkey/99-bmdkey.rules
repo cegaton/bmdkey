@@ -1,0 +1,17 @@
+# udev rules for bmdkey (Blackmagic Speed Editor on Linux)
+#
+# Install:
+#   sudo cp 99-bmdkey.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# then unplug/replug the Speed Editor and log out and back in once.
+
+# The real Speed Editor: let bmdkey open it without sudo.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1edb", ATTRS{idProduct}=="da0e", MODE="0666"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1edb", ATTRS{idProduct}=="da0e", MODE="0666"
+
+# Resolve pass-through: let the logged-in user create virtual HID devices
+# (bmdkey's virtual Speed Editor). Same approach Steam uses for controllers.
+KERNEL=="uhid", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uhid"
+
+# ...and let Resolve open the virtual Speed Editor bmdkey creates.
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", KERNELS=="0003:1EDB:DA0E.*", MODE="0666"
