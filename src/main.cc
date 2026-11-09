@@ -18,6 +18,8 @@
 #include <fstream>
 #include <sstream>
 #include <optional>
+#include <fcntl.h>
+#include <linux/uhid.h>
 #include <hidapi.h>
 #include <fmt/format.h>
 #include <X11/Xlib.h>
@@ -41,6 +43,7 @@ static int maxKeycode;
 static volatile sig_atomic_t running = true;
 static volatile sig_atomic_t reloadRequested = false;
 static bool learnMode = false;
+static bool traceMode = false;
 
 void signalHandler(int)
 {
@@ -237,6 +240,10 @@ struct Config
     int defaultMode = MODE_JOG;
     bool keyLeds = true;
     int sequenceDelayMs = 10;
+    /* Resolve pass-through: keys listed here are taken over while Resolve
+     * has the virtual Speed Editor open; every other key stays native. */
+    bool resolvePassthrough = true;
+    std::map<int, Action> resolveKeys;
 };
 
 static Config config;
@@ -470,6 +477,11 @@ static const char DEFAULT_CONFIG[] = R"CONF(# bmdkey configuration
 #
 # SHTL, JOG and SCRL are reserved: they switch the wheel between the three
 # [wheel.*] sections below, and light up to show which one is active.
+#
+# DAVINCI RESOLVE: while Resolve is running, bmdkey hands it a virtual Speed
+# Editor, so the keys, wheel and lights work natively in Resolve. [keys] and
+# [wheel.*] are then ignored; only keys listed in [resolve.keys] are taken
+# over. Start bmdkey before Resolve.
 
 [general]
 # Wheel mode at startup: jog, shtl or scrl
@@ -478,6 +490,9 @@ default_mode = jog
 key_leds = on
 # Pause between the steps of a sequence, in milliseconds
 sequence_delay_ms = 10
+# Pass the Speed Editor through to DaVinci Resolve (needs the udev rules;
+# takes effect when bmdkey restarts)
+resolve_passthrough = on
 
 [keys]
 SMART_INSRT  = F1
@@ -540,6 +555,12 @@ right = Right
 step  = 6000
 left  = scroll_up
 right = scroll_down
+
+# Keys to take over inside DaVinci Resolve. Anything not listed here keeps its
+# normal Resolve function. Same action syntax as [keys]. Examples:
+[resolve.keys]
+# CAM9      = ctrl+shift+F9
+# SYNC_BIN  = exec:notify-send "Sync bin pressed"
 )CONF";
 
 static std::optional<bool> parseBool(const std::string& v)
@@ -646,10 +667,17 @@ static bool loadConfig(const std::string& path, Config& out)
                 else
                     warn("sequence_delay_ms must be a number >= 0");
             }
+            else if (k == "resolve_passthrough")
+            {
+                if (auto b = parseBool(value))
+                    cfg.resolvePassthrough = *b;
+                else
+                    warn("resolve_passthrough must be on or off");
+            }
             else
                 warn(fmt::format("unknown setting '{}'", key));
         }
-        else if (section == "keys")
+        else if ((section == "keys") || (section == "resolve.keys"))
         {
             auto code = keyCodeFromName(key);
             if (!code)
@@ -660,8 +688,7 @@ static bool loadConfig(const std::string& path, Config& out)
             if ((*code == KEY_SHTL) || (*code == KEY_JOG) ||
                 (*code == KEY_SCRL))
             {
-                warn(fmt::format(
-                    "{} is reserved for switching wheel modes", key));
+                warn(fmt::format("{} is reserved for the wheel modes", key));
                 continue;
             }
             std::string error;
@@ -671,7 +698,10 @@ static bool loadConfig(const std::string& path, Config& out)
                 warn(fmt::format("{}: {}", key, error));
                 continue;
             }
-            cfg.keys[*code] = *action;
+            if (section == "keys")
+                cfg.keys[*code] = *action;
+            else
+                cfg.resolveKeys[*code] = *action;
         }
         else if (section.rfind("wheel.", 0) == 0)
         {
@@ -711,9 +741,10 @@ static bool loadConfig(const std::string& path, Config& out)
             warn(fmt::format("unknown section [{}]", section));
     }
 
-    fmt::print("Loaded {} ({} key mappings{})\n",
+    fmt::print("Loaded {} ({} key mappings, {} for Resolve{})\n",
         path,
         cfg.keys.size(),
+        cfg.resolveKeys.size(),
         problems ? fmt::format(", {} problem(s) skipped", problems) : "");
     out = cfg;
     return true;
@@ -1152,6 +1183,36 @@ public:
         return data;
     }
 
+    /* Raw calls for Resolve pass-through. They return -1 on failure instead
+     * of throwing, so one bad request from Resolve can't drop the device. */
+    int getFeatureRaw(uint8_t* buf, size_t len)
+    {
+        return hid_get_feature_report(_handle, buf, len);
+    }
+
+    int sendFeatureRaw(const uint8_t* buf, size_t len)
+    {
+        return hid_send_feature_report(_handle, buf, len);
+    }
+
+    int writeRaw(const uint8_t* buf, size_t len)
+    {
+        return hid_write(_handle, buf, len);
+    }
+
+    std::string lastError()
+    {
+        const wchar_t* w = hid_error(_handle);
+        if (!w)
+            return "unknown error";
+        char buf[256];
+        size_t n = wcstombs(buf, w, sizeof(buf) - 1);
+        if (n == (size_t)-1)
+            return "unknown error";
+        buf[n] = 0;
+        return buf;
+    }
+
 private:
     void checkError(int res)
     {
@@ -1209,6 +1270,24 @@ static void setWheelMode(HidDevice& device, int mode)
     fmt::print("Wheel mode: {}\n", MODE_NAMES[mode]);
 }
 
+static void startKeyAction(int keynum, const Action& action)
+{
+    if (action.holdable())
+        heldKeys[keynum] = pressStep(action.steps[0]);
+    else
+        tapAction(action);
+}
+
+static void stopKeyAction(int keynum)
+{
+    auto it = heldKeys.find(keynum);
+    if (it != heldKeys.end())
+    {
+        releasePressed(it->second);
+        heldKeys.erase(it);
+    }
+}
+
 static void pressReleaseKey(HidDevice& device, int keynum, bool pressed)
 {
     if (keynum == KEY_JOG || keynum == KEY_SHTL || keynum == KEY_SCRL)
@@ -1223,12 +1302,7 @@ static void pressReleaseKey(HidDevice& device, int keynum, bool pressed)
 
     if (!pressed)
     {
-        auto it = heldKeys.find(keynum);
-        if (it != heldKeys.end())
-        {
-            releasePressed(it->second);
-            heldKeys.erase(it);
-        }
+        stopKeyAction(keynum);
         return;
     }
 
@@ -1242,11 +1316,7 @@ static void pressReleaseKey(HidDevice& device, int keynum, bool pressed)
     if ((it == config.keys.end()) || it->second.empty())
         return;
 
-    const Action& action = it->second;
-    if (action.holdable())
-        heldKeys[keynum] = pressStep(action.steps[0]);
-    else
-        tapAction(action);
+    startKeyAction(keynum, it->second);
 }
 
 static void handleWheel(int32_t delta)
@@ -1283,6 +1353,7 @@ static void processXEvents()
 }
 
 static FileStamp configStamp;
+static bool resolveAttached = false;
 
 static void reloadConfigIfChanged(HidDevice* device)
 {
@@ -1303,16 +1374,389 @@ static void reloadConfigIfChanged(HidDevice* device)
     }
     releaseAll();
     config = fresh;
-    if (device)
+    if (device && !resolveAttached)
         updateKeyLeds(*device);
+}
+
+
+/* ------------------------------------------------------------------------ */
+/* DaVinci Resolve pass-through                                              */
+/*                                                                           */
+/*   real Speed Editor <-> bmdkey <-> virtual Speed Editor (uhid) <-> Resolve */
+/*                                                                           */
+/* bmdkey opens the real device through libusb, which detaches the kernel   */
+/* driver, so its /dev/hidraw node disappears and Resolve can only find the  */
+/* virtual one. While Resolve has the virtual device open, everything is     */
+/* relayed both ways -- including Resolve's own unlock handshake, which the  */
+/* real device answers -- except keys listed in [resolve.keys].              */
+/* ------------------------------------------------------------------------ */
+
+/* The real Speed Editor's HID report descriptor (from
+ * /sys/class/hidraw/hidrawN/device/report_descriptor). */
+static const uint8_t SPEED_EDITOR_DESCRIPTOR[] = {
+    0x06, 0x00, 0xff, 0x09, 0x00, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x01, 0x85,
+    0x01, 0x05, 0x06, 0x15, 0x00, 0x26, 0xff, 0x00, 0x09, 0x2a, 0x75, 0x08,
+    0x95, 0x04, 0xb1, 0x81, 0x09, 0x2d, 0x09, 0x2e, 0x09, 0x2f, 0x75, 0x08,
+    0x95, 0x03, 0xb1, 0x81, 0xc0, 0x09, 0x08, 0xa1, 0x01, 0x85, 0x08, 0x06,
+    0x07, 0xff, 0x15, 0x00, 0x26, 0xff, 0x00, 0x09, 0x00, 0x75, 0x08, 0x95,
+    0x20, 0xb1, 0x81, 0xc0, 0x09, 0x02, 0xa1, 0x01, 0x85, 0x03, 0x06, 0x01,
+    0xff, 0x15, 0x00, 0x26, 0xff, 0x00, 0x09, 0x00, 0x75, 0x08, 0x95, 0x01,
+    0x81, 0x02, 0x09, 0x01, 0x75, 0x08, 0x95, 0x04, 0x81, 0x02, 0x09, 0x02,
+    0x75, 0x08, 0x95, 0x01, 0x81, 0x02, 0x09, 0x00, 0x75, 0x08, 0x95, 0x01,
+    0x91, 0x02, 0x09, 0x01, 0x75, 0x08, 0x95, 0x04, 0x91, 0x02, 0x09, 0x02,
+    0x75, 0x08, 0x95, 0x01, 0x91, 0x02, 0xc0, 0x09, 0x03, 0xa1, 0x01, 0x85,
+    0x04, 0x06, 0x02, 0xff, 0x15, 0x00, 0x26, 0xff, 0x00, 0x19, 0x00, 0x29,
+    0xff, 0x75, 0x10, 0x95, 0x06, 0x81, 0x00, 0x15, 0x00, 0x25, 0x01, 0x19,
+    0x01, 0x29, 0x08, 0x75, 0x01, 0x95, 0x08, 0x91, 0x02, 0xc0, 0x09, 0x06,
+    0xa1, 0x01, 0x85, 0x02, 0x06, 0x05, 0xff, 0x15, 0x00, 0x25, 0x01, 0x19,
+    0x01, 0x29, 0x20, 0x75, 0x01, 0x95, 0x20, 0x91, 0x02, 0xc0, 0x09, 0x04,
+    0xa1, 0x01, 0x85, 0x05, 0x06, 0x03, 0xff, 0x15, 0x00, 0x26, 0xff, 0x00,
+    0x09, 0x00, 0x75, 0x08, 0x95, 0x01, 0xb1, 0x82, 0x09, 0x01, 0x75, 0x08,
+    0x95, 0x04, 0xb1, 0x82, 0x09, 0x02, 0x75, 0x08, 0x95, 0x02, 0xb1, 0x82,
+    0xc0, 0x09, 0x05, 0xa1, 0x01, 0x85, 0x06, 0x06, 0x04, 0xff, 0x15, 0x00,
+    0x26, 0xff, 0x00, 0x09, 0x00, 0x75, 0x08, 0x95, 0x01, 0xb1, 0x82, 0x09,
+    0x01, 0x75, 0x08, 0x95, 0x08, 0xb1, 0x82, 0xc0, 0x09, 0x07, 0xa1, 0x01,
+    0x85, 0x07, 0x06, 0x06, 0xff, 0x15, 0x00, 0x26, 0xff, 0x00, 0x09, 0x00,
+    0x75, 0x08, 0x95, 0x01, 0x81, 0x02, 0x09, 0x01, 0x75, 0x08, 0x95, 0x01,
+    0x81, 0x02, 0x09, 0x00, 0x75, 0x08, 0x95, 0x01, 0xb1, 0x02, 0x09, 0x01,
+    0x75, 0x08, 0x95, 0x01, 0xb1, 0x02, 0xc0, 0xc0,
+};
+static_assert(sizeof(SPEED_EDITOR_DESCRIPTOR) == 308);
+
+class VirtualSpeedEditor
+{
+public:
+    /* Returns false (after explaining why) if /dev/uhid can't be used; bmdkey
+     * then simply runs without pass-through. */
+    bool create()
+    {
+        _fd = open("/dev/uhid", O_RDWR | O_CLOEXEC | O_NONBLOCK);
+        if (_fd < 0)
+        {
+            fmt::print(stderr,
+                "Resolve pass-through off: can't open /dev/uhid ({}). "
+                "Install 99-bmdkey.rules (see README).\n",
+                strerror(errno));
+            return false;
+        }
+
+        struct uhid_event ev = {};
+        ev.type = UHID_CREATE2;
+        auto& c = ev.u.create2;
+        strncpy((char*)c.name,
+            "Blackmagic Design DaVinci Resolve Speed Editor",
+            sizeof(c.name) - 1);
+        strncpy((char*)c.phys, "bmdkey/virtual", sizeof(c.phys) - 1);
+        strncpy((char*)c.uniq, "bmdkey-virtual", sizeof(c.uniq) - 1);
+        c.rd_size = sizeof(SPEED_EDITOR_DESCRIPTOR);
+        c.bus = 0x03; /* BUS_USB */
+        c.vendor = 0x1edb;
+        c.product = 0xda0e;
+        c.version = 0x0100;
+        memcpy(c.rd_data, SPEED_EDITOR_DESCRIPTOR, c.rd_size);
+        if (!sendEvent(ev))
+        {
+            close(_fd);
+            _fd = -1;
+            return false;
+        }
+        fmt::print("Virtual Speed Editor ready for DaVinci Resolve\n");
+        return true;
+    }
+
+    ~VirtualSpeedEditor()
+    {
+        if (_fd >= 0)
+        {
+            struct uhid_event ev = {};
+            ev.type = UHID_DESTROY;
+            sendEvent(ev);
+            close(_fd);
+        }
+    }
+
+    bool active() const
+    {
+        return _fd >= 0;
+    }
+
+    int fd() const
+    {
+        return _fd;
+    }
+
+    /* An input report (keys, wheel, battery...) for Resolve to read. */
+    void sendInput(const uint8_t* data, size_t len)
+    {
+        struct uhid_event ev = {};
+        ev.type = UHID_INPUT2;
+        ev.u.input2.size = std::min(len, sizeof(ev.u.input2.data));
+        memcpy(ev.u.input2.data, data, ev.u.input2.size);
+        sendEvent(ev);
+    }
+
+    bool sendEvent(const struct uhid_event& ev)
+    {
+        if (write(_fd, &ev, sizeof(ev)) != (ssize_t)sizeof(ev))
+        {
+            fmt::print(stderr, "uhid write failed: {}\n", strerror(errno));
+            return false;
+        }
+        return true;
+    }
+
+    /* Next pending event, without blocking. */
+    bool readEvent(struct uhid_event& ev)
+    {
+        return read(_fd, &ev, sizeof(ev)) > 0;
+    }
+
+private:
+    int _fd = -1;
+};
+
+/* Keys whose press was passed to Resolve; their release must follow. */
+static std::set<uint16_t> forwardedKeys;
+static std::vector<uint8_t> lastForwardedKeyReport;
+static bool resolveUnlockedReported = false;
+static std::chrono::steady_clock::time_point nextAuth;
+
+static void restoreStandalone(HidDevice& device);
+
+static void onResolveAttach()
+{
+    releaseAll();
+    forwardedKeys.clear();
+    lastForwardedKeyReport.clear();
+    resolveUnlockedReported = false;
+    resolveAttached = true;
+    fmt::print("Resolve connected: Speed Editor passed through "
+               "({} key(s) taken over)\n",
+        config.resolveKeys.size());
+}
+
+static void onResolveDetach(HidDevice& device)
+{
+    resolveAttached = false;
+    releaseAll();
+    forwardedKeys.clear();
+    fmt::print("Resolve disconnected: back to the standalone mapping\n");
+    restoreStandalone(device);
+}
+
+/* Feature report sizes from the descriptor, including the report id byte.
+ * The device must be asked for exactly this much: a larger request may be
+ * refused, and Resolve gives up on the device at the first error. */
+static size_t featureReportSize(uint8_t id)
+{
+    switch (id)
+    {
+        case 1: return 8;
+        case 5: return 8;
+        case 6: return 10;
+        case 7: return 3;
+        case 8: return 33;
+        default: return 64;
+    }
+}
+
+static std::string hexBytes(const uint8_t* p, size_t n)
+{
+    std::string s;
+    for (size_t i = 0; i < n; i++)
+        s += fmt::format("{:02x} ", p[i]);
+    return s;
+}
+
+/* --trace: every message between Resolve and the device. */
+template <typename... Args>
+static void trace(fmt::format_string<Args...> f, Args&&... args)
+{
+    if (traceMode)
+        fmt::print("[trace] {}\n", fmt::format(f, std::forward<Args>(args)...));
+}
+
+/* Handle everything Resolve asked of the virtual device since last time. */
+static void serviceVirtual(VirtualSpeedEditor& virt, HidDevice& device)
+{
+    struct uhid_event ev;
+    while (virt.readEvent(ev))
+    {
+        switch (ev.type)
+        {
+            case UHID_OPEN:
+                trace("OPEN");
+                onResolveAttach();
+                break;
+
+            case UHID_CLOSE:
+                trace("CLOSE");
+                onResolveDetach(device);
+                break;
+
+            case UHID_OUTPUT:
+            {
+                /* Lights, wheel mode. */
+                auto& o = ev.u.output;
+                if (o.rtype == UHID_OUTPUT_REPORT && o.size)
+                {
+                    int n = device.writeRaw(o.data, o.size);
+                    trace("OUTPUT  {}-> {}",
+                        hexBytes(o.data, o.size),
+                        (n >= 0) ? "ok" : "FAILED: " + device.lastError());
+                }
+                else
+                    trace("OUTPUT  type {} ignored", (int)o.rtype);
+                break;
+            }
+
+            case UHID_GET_REPORT:
+            {
+                auto& g = ev.u.get_report;
+                struct uhid_event reply = {};
+                reply.type = UHID_GET_REPORT_REPLY;
+                reply.u.get_report_reply.id = g.id;
+                int n = -1;
+                uint8_t buf[64] = {g.rnum};
+                if (g.rtype == UHID_FEATURE_REPORT)
+                {
+                    n = device.getFeatureRaw(buf, featureReportSize(g.rnum));
+                    if (n > 0)
+                    {
+                        memcpy(reply.u.get_report_reply.data, buf, n);
+                        reply.u.get_report_reply.size = n;
+                        /* 06 04 = the device accepted Resolve's unlock. */
+                        if ((g.rnum == 6) && (n > 1) && (buf[1] == 4) &&
+                            !resolveUnlockedReported)
+                        {
+                            fmt::print("Resolve unlocked the Speed Editor\n");
+                            resolveUnlockedReported = true;
+                        }
+                    }
+                }
+                reply.u.get_report_reply.err = (n > 0) ? 0 : EIO;
+                if (g.rtype != UHID_FEATURE_REPORT)
+                    trace("GET     report {} type {}: not supported",
+                        (int)g.rnum, (int)g.rtype);
+                else
+                    trace("GET     report {} -> {}",
+                        (int)g.rnum,
+                        (n > 0) ? hexBytes(buf, n)
+                                : "FAILED: " + device.lastError());
+                virt.sendEvent(reply);
+                break;
+            }
+
+            case UHID_SET_REPORT:
+            {
+                auto& r = ev.u.set_report;
+                int n = -1;
+                if (r.rtype == UHID_FEATURE_REPORT)
+                    n = device.sendFeatureRaw(r.data, r.size);
+                else if (r.rtype == UHID_OUTPUT_REPORT)
+                    n = device.writeRaw(r.data, r.size);
+
+                struct uhid_event reply = {};
+                reply.type = UHID_SET_REPORT_REPLY;
+                reply.u.set_report_reply.id = r.id;
+                reply.u.set_report_reply.err = (n >= 0) ? 0 : EIO;
+                trace("SET     {}{}-> {}",
+                    (r.rtype == UHID_FEATURE_REPORT) ? "feature " : "",
+                    hexBytes(r.data, r.size),
+                    (n >= 0) ? "ok" : "FAILED: " + device.lastError());
+                virt.sendEvent(reply);
+                break;
+            }
+
+            default: /* UHID_START, UHID_STOP */
+                break;
+        }
+    }
+}
+
+/* Key packet while Resolve is attached: run [resolve.keys] ourselves, pass
+ * everything else on with those keys removed. */
+static void proxyKeyPacket(
+    VirtualSpeedEditor& virt, const std::vector<uint8_t>& data)
+{
+    std::vector<uint16_t> order;
+    std::set<uint16_t> newState;
+    for (int i = 0; (i < 6) && (2 + i * 2 < (int)data.size()); i++)
+    {
+        uint16_t k = getInt16(&data[1 + i * 2]);
+        if (k)
+        {
+            order.push_back(k);
+            newState.insert(k);
+        }
+    }
+
+    for (uint16_t k : newState)
+    {
+        if (currentKeyboardState.count(k))
+            continue;
+        /* Newly pressed: ours or Resolve's? Decided now, for the whole
+         * press, so a config reload can't strand a key in Resolve. */
+        auto it = config.resolveKeys.find(k);
+        bool ours = (it != config.resolveKeys.end()) && !it->second.empty();
+        if (learnMode)
+            fmt::print("Key {:<12} (0x{:02x}) -> {}\n",
+                keyName(k),
+                k,
+                ours ? it->second.text : std::string("Resolve (native)"));
+        if (ours)
+            startKeyAction(k, it->second);
+        else
+            forwardedKeys.insert(k);
+    }
+    for (uint16_t k : currentKeyboardState)
+    {
+        if (newState.count(k))
+            continue;
+        if (!forwardedKeys.erase(k))
+            stopKeyAction(k);
+    }
+    currentKeyboardState = newState;
+
+    std::vector<uint8_t> out(13, 0);
+    out[0] = 4;
+    int slot = 0;
+    for (uint16_t k : order)
+        if (forwardedKeys.count(k))
+        {
+            out[1 + slot * 2] = k & 0xff;
+            out[2 + slot * 2] = k >> 8;
+            slot++;
+        }
+    if (out != lastForwardedKeyReport)
+    {
+        virt.sendInput(out.data(), out.size());
+        lastForwardedKeyReport = out;
+    }
+}
+
+/* Unlock the device ourselves and put back our lights and wheel mode. Used
+ * at connect time and whenever Resolve lets go of the device. */
+static void restoreStandalone(HidDevice& device)
+{
+    authenticate(device);
+    device.send({3, 0, 0, 0, 0, 0, 0});
+    updateKeyLeds(device);
+    wheelPosition = sentWheelPosition = 0;
+    setWheelMode(device, wheelMode);
+    currentKeyboardState.clear();
+    nextAuth = std::chrono::steady_clock::now() +
+               std::chrono::milliseconds(TIMEOUT_MS);
 }
 
 static void usage()
 {
     fmt::print(
-        "Usage: bmdkey [-c CONFIG] [--learn]\n"
+        "Usage: bmdkey [-c CONFIG] [--learn] [--trace]\n"
         "  -c, --config FILE       config file (default {})\n"
         "  -l, --learn             print each key/wheel event as it happens\n"
+        "  -t, --trace             print all traffic between Resolve and the "
+        "device\n"
         "      --print-default-config\n"
         "                          write the built-in default config to "
         "stdout\n",
@@ -1333,6 +1777,8 @@ int main(int argc, char** argv)
             configPath = argv[++i];
         else if ((a == "-l") || (a == "--learn"))
             learnMode = true;
+        else if ((a == "-t") || (a == "--trace"))
+            traceMode = true;
         else if (a == "--print-default-config")
         {
             fputs(DEFAULT_CONFIG, stdout);
@@ -1382,24 +1828,37 @@ int main(int argc, char** argv)
         try
         {
             HidDevice device(0x1edb, 0xda0e);
-            authenticate(device);
+            resolveAttached = false;
+            restoreStandalone(device);
 
-            device.send({3, 0, 0, 0, 0, 0, 0});
-            updateKeyLeds(device);
-            wheelPosition = sentWheelPosition = 0;
-            setWheelMode(device, wheelMode);
-            currentKeyboardState.clear();
+            /* Created only while the real device is connected, so Resolve
+             * sees it come and go along with the hardware. */
+            VirtualSpeedEditor virt;
+            if (config.resolvePassthrough)
+                virt.create();
+            /* With pass-through we must answer Resolve quickly, so poll the
+             * device with a short timeout. */
+            int readTimeout = virt.active() ? 5 : POLL_MS;
 
-            auto nextAuth = std::chrono::steady_clock::now() +
-                            std::chrono::milliseconds(TIMEOUT_MS);
             while (running)
             {
                 processXEvents();
                 reloadConfigIfChanged(&device);
+                if (virt.active())
+                    serviceVirtual(virt, device);
 
                 try
                 {
-                    auto data = device.recv(POLL_MS);
+                    auto data = device.recv(readTimeout);
+
+                    if (resolveAttached)
+                    {
+                        if (data[0] == 4)
+                            proxyKeyPacket(virt, data);
+                        else
+                            virt.sendInput(data.data(), data.size());
+                        continue;
+                    }
 
                     switch (data[0])
                     {
@@ -1451,7 +1910,9 @@ int main(int argc, char** argv)
                 {
                 }
 
-                if (std::chrono::steady_clock::now() >= nextAuth)
+                /* While Resolve is attached it does its own unlocking. */
+                if (!resolveAttached &&
+                    (std::chrono::steady_clock::now() >= nextAuth))
                 {
                     authenticate(device);
                     nextAuth = std::chrono::steady_clock::now() +

@@ -112,7 +112,7 @@ _KEY_ALIASES = {"RIPL_O_WR": "RIPL_OWR", "SRC_O_WR": "SRC_OWR",
 
 
 def _norm(section, key):
-    if section == "keys":
+    if section in ("keys", "resolve.keys"):
         k = key.upper()
         for c in " -/":
             k = k.replace(c, "_")
@@ -180,7 +180,8 @@ class ConfigDoc:
             self.lines[i] = f"{before}= {value}"
             return
 
-        new_line = f"{key:<12} = {value}" if section == "keys" \
+        new_line = f"{key:<12} = {value}" \
+            if section in ("keys", "resolve.keys") \
             else f"{key} = {value}"
         if section in sections:
             self.lines.insert(sections[section][1] + 1, new_line)
@@ -360,31 +361,37 @@ class ActionEntry(ttk.Frame):
         self.var.set(value)
 
 
-class MappingEditor:
-    def __init__(self, keys_tab, wheel_tab):
-        self.doc = ConfigDoc(CONFIG_PATH)
-        self.dirty = False
-        self._build_keys(keys_tab)
-        self._build_wheel(wheel_tab)
-        self.refresh()
+class KeyTable:
+    """Key list + edit panel for one config section ([keys] or
+    [resolve.keys])."""
 
-    # ---- Keys tab -------------------------------------------------------
-    def _build_keys(self, tab):
+    def __init__(self, editor, tab, section, empty_text, intro=None):
+        self.editor = editor
+        self.section = section
+        self.empty_text = empty_text
+        row = 0
+        if intro:
+            intro(tab, row)
+            row += 1
+
         cols = ("label", "action")
         self.tree = ttk.Treeview(tab, columns=cols, show="headings",
-                                 height=14, selectmode="browse")
+                                 height=12 if intro else 14,
+                                 selectmode="browse")
         self.tree.heading("label", text="Speed Editor key")
         self.tree.heading("action", text="Action")
         self.tree.column("label", width=150, stretch=False)
         self.tree.column("action", width=380)
         sb = ttk.Scrollbar(tab, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        sb.grid(row=0, column=1, sticky="ns")
+        self.tree.grid(row=row, column=0, sticky="nsew")
+        sb.grid(row=row, column=1, sticky="ns")
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        tab.rowconfigure(row, weight=1)
+        row += 1
 
         edit = ttk.LabelFrame(tab, text="Edit selected key", padding=8)
-        edit.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        edit.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.sel_label = ttk.Label(edit, text="(select a key)",
                                    font=("Sans", 10, "bold"))
         self.sel_label.grid(row=0, column=0, sticky="w")
@@ -397,11 +404,11 @@ class MappingEditor:
                              pady=(6, 0))
         self.key_action.entry.bind("<Return>", lambda e: self._apply_key())
         edit.columnconfigure(1, weight=1)
+        row += 1
 
         ttk.Label(tab, text=ACTION_HELP, foreground="#666",
-                  justify="left").grid(row=2, column=0, columnspan=2,
+                  justify="left").grid(row=row, column=0, columnspan=2,
                                        sticky="w", pady=(6, 0))
-        tab.rowconfigure(0, weight=1)
         tab.columnconfigure(0, weight=1)
 
     def _on_select(self, _):
@@ -411,28 +418,57 @@ class MappingEditor:
         name = sel[0]
         label = dict(SPEED_EDITOR_KEYS)[name]
         self.sel_label.config(text=label)
-        self.key_action.set(self.doc.get("keys", name))
+        self.key_action.set(self.editor.doc.get(self.section, name))
 
     def _apply_key(self):
         sel = self.tree.selection()
         if not sel:
             return
-        self.doc.set("keys", sel[0], self.key_action.get())
-        self._mark_dirty()
-        self._refresh_tree(keep=sel[0])
+        self.editor.doc.set(self.section, sel[0], self.key_action.get())
+        self.editor._mark_dirty()
+        self.refresh(keep=sel[0])
 
     def _clear_key(self):
         self.key_action.set("")
         self._apply_key()
 
-    def _refresh_tree(self, keep=None):
+    def refresh(self, keep=None):
         self.tree.delete(*self.tree.get_children())
         for name, label in SPEED_EDITOR_KEYS:
-            action = self.doc.get("keys", name) or "—"
+            action = self.editor.doc.get(self.section, name) or self.empty_text
             self.tree.insert("", "end", iid=name, values=(label, action))
         if keep:
             self.tree.selection_set(keep)
             self.tree.see(keep)
+
+
+class MappingEditor:
+    def __init__(self, keys_tab, wheel_tab, resolve_tab):
+        self.doc = ConfigDoc(CONFIG_PATH)
+        self.dirty = False
+        self.passthrough = tk.BooleanVar()
+        self.tables = [
+            KeyTable(self, keys_tab, "keys", "—"),
+            KeyTable(self, resolve_tab, "resolve.keys", "native",
+                     intro=self._resolve_intro),
+        ]
+        self._build_wheel(wheel_tab)
+        self.refresh()
+
+    def _resolve_intro(self, tab, row):
+        box = ttk.Frame(tab)
+        box.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ttk.Checkbutton(
+            box, text="Pass the Speed Editor through to DaVinci Resolve "
+            "(applies when bmdkey restarts)", variable=self.passthrough,
+            command=self._mark_dirty).pack(anchor="w")
+        ttk.Label(
+            box, foreground="#666", justify="left", wraplength=620,
+            text="While Resolve runs, keys, wheel and lights work natively. "
+                 "Give a key an action here only to take it over inside "
+                 "Resolve (empty = native). The Keys and Wheel tabs apply "
+                 "outside Resolve. Start bmdkey before Resolve.").pack(
+            anchor="w", pady=(2, 0))
 
     # ---- Wheel tab ------------------------------------------------------
     def _build_wheel(self, tab):
@@ -496,6 +532,8 @@ class MappingEditor:
         self.doc.set("general", "key_leds",
                      "on" if self.key_leds.get() else "off")
         self.doc.set("general", "sequence_delay_ms", self.seq_delay.get())
+        self.doc.set("general", "resolve_passthrough",
+                     "on" if self.passthrough.get() else "off")
 
     # ---- shared ---------------------------------------------------------
     def _mark_dirty(self):
@@ -506,7 +544,11 @@ class MappingEditor:
 
     def refresh(self):
         self._loading = True
-        self._refresh_tree()
+        for table in self.tables:
+            table.refresh()
+        self.passthrough.set(
+            self.doc.get("general", "resolve_passthrough", "on").lower()
+            in ("on", "yes", "true", "1"))
         for mode, (step, left, right) in self.wheel_widgets.items():
             sec = f"wheel.{mode}"
             step.set(self.doc.get(sec, "step", "12000"))
@@ -574,15 +616,17 @@ log_text.pack(fill="both", expand=True, pady=(10, 0))
 # ---- Mapping tabs --------------------------------------------------------
 keys_tab = ttk.Frame(notebook, padding=10)
 wheel_tab = ttk.Frame(notebook, padding=10)
+resolve_tab = ttk.Frame(notebook, padding=10)
 notebook.add(keys_tab, text="Keys")
 notebook.add(wheel_tab, text="Wheel")
+notebook.add(resolve_tab, text="Resolve")
 
 bottom = ttk.Frame(root, padding=(8, 6))
 bottom.pack(fill="x")
 save_status = ttk.Label(bottom, text="", foreground="#666")
 save_status.pack(side="left")
 
-editor = MappingEditor(keys_tab, wheel_tab)
+editor = MappingEditor(keys_tab, wheel_tab, resolve_tab)
 
 ttk.Button(bottom, text="Save", command=editor.save).pack(side="right")
 ttk.Button(bottom, text="Revert", command=editor.revert).pack(

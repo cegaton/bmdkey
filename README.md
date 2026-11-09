@@ -2,7 +2,8 @@ bmdkey (configurable fork)
 ==========================
 
 Use a **Blackmagic Design Speed Editor** as a programmable macro pad and jog
-wheel on Linux (X11), without DaVinci Resolve.
+wheel on Linux (X11), in any application, and keep it working natively in
+DaVinci Resolve with your own keys added.
 
 This fork of [David Given's bmdkey](https://github.com/davidgiven/bmdkey) adds
 a plain-text config file, so you can remap every key and the wheel **without
@@ -32,9 +33,10 @@ Features
   each wheel movement.
 - **Survives unplugging.** If the Speed Editor is disconnected, bmdkey
   releases any held keys and waits for it to come back.
-
-> Only works while DaVinci Resolve is **closed**, because Resolve takes over
-> the device.
+- **DaVinci Resolve pass-through.** While Resolve runs, bmdkey passes the
+  Speed Editor through to it, so every key, the wheel and the lights work
+  natively. Only the keys you list in `[resolve.keys]` are taken over. See
+  [DaVinci Resolve](#davinci-resolve).
 
 Building
 --------
@@ -42,8 +44,7 @@ Building
 Dependencies on Debian / Ubuntu / Linux Mint:
 
 ```bash
-sudo apt install build-essential pkg-config \
-    libhidapi-dev libfmt-dev libx11-dev libxtst-dev python3-tk
+sudo apt install build-essential pkg-config libhidapi-dev libfmt-dev libx11-dev libxtst-dev python3-tk
 ```
 
 Build:
@@ -58,20 +59,30 @@ make
 `python3-tk` is only needed for the GUI. If you're rebuilding over an older
 checkout, delete the `.obj` folder first (`rm -rf .obj`).
 
-### USB permissions (one time)
+### Permissions (one time)
 
-To run bmdkey as your normal user (recommended, not with `sudo`), add a udev
-rule:
+To run bmdkey as your normal user (recommended, not with `sudo`), install the
+udev rules that come with it:
 
 ```bash
-echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="1edb", ATTRS{idProduct}=="da0e", MODE="0666"
-KERNEL=="hidraw*", ATTRS{idVendor}=="1edb", ATTRS{idProduct}=="da0e", MODE="0666"' \
-  | sudo tee /etc/udev/rules.d/99-speed-editor.rules
+sudo cp 99-bmdkey.rules /etc/udev/rules.d/
+sudo modprobe uhid
+echo uhid | sudo tee /etc/modules-load.d/uhid.conf
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-Then unplug the Speed Editor and plug it back in. If bmdkey prints
-`Waiting...` forever while the device is connected, this step is missing.
+The `uhid` lines load the kernel module for the virtual Speed Editor now and
+at every boot; without them the rule may not reach `/dev/uhid`. Check with
+`getfacl /dev/uhid`: your username should be listed with `rw-`.
+
+Then unplug the Speed Editor, plug it back in, and **log out and back in
+once**. The rules let you open the Speed Editor, create the virtual Speed
+Editor used for Resolve (`/dev/uhid`), and let Resolve open that virtual
+device. If you added `99-speed-editor.rules` from an earlier version, delete
+it; this file replaces it.
+
+If bmdkey prints `Waiting...` forever while the device is connected, this
+step is missing.
 
 Running
 -------
@@ -79,6 +90,7 @@ Running
 ```bash
 ./bmdkey              # normal use
 ./bmdkey --learn      # also print every key / wheel event
+./bmdkey --trace      # also print all traffic between Resolve and the device
 ./bmdkey -c my.conf   # use a different config file
 ```
 
@@ -173,6 +185,40 @@ such as `0x2a` are also accepted.
 Smaller means more actions per turn; 12000 is roughly 30 per revolution.
 Wheel actions can be anything a key can do, including sequences and `exec:`.
 
+DaVinci Resolve
+---------------
+
+Normally Resolve takes the Speed Editor for itself, and nothing else can use
+it. With bmdkey running, Resolve instead finds a **virtual Speed Editor**
+created by bmdkey, and bmdkey sits in between:
+
+```
+real Speed Editor ⇄ bmdkey ⇄ virtual Speed Editor ⇄ DaVinci Resolve
+```
+
+- **Switching is automatic.** When Resolve opens the virtual device, bmdkey
+  prints `Resolve connected` and starts passing everything through. When you
+  quit Resolve, it prints `Resolve disconnected` and goes back to your
+  `[keys]` / `[wheel.*]` mapping.
+- **Native in Resolve.** All keys, the wheel (with SHTL / JOG / SCRL) and the
+  lights behave exactly as with the device plugged straight in. Resolve's own
+  unlock handshake is answered by the real device, so Resolve sees a genuine
+  Speed Editor.
+- **Your keys in Resolve.** List keys in `[resolve.keys]` to take them over.
+  Resolve never sees those keys; bmdkey runs your action instead. Every key
+  you don't list stays native.
+
+```ini
+[resolve.keys]
+CAM9     = ctrl+shift+F9                 # a shortcut you set up in Resolve
+SYNC_BIN = exec:~/scripts/render_proxy.sh
+```
+
+**Start bmdkey before Resolve.** If Resolve is already running, restart it
+once after starting bmdkey. Set `resolve_passthrough = off` in `[general]` if
+you'd rather bmdkey left Resolve alone; bmdkey then holds the device and
+Resolve won't see it.
+
 GUI
 ---
 
@@ -187,6 +233,8 @@ python3 bdm_gui.py
   **Apply**, then **Save** (or Ctrl+S).
 - **Wheel.** Step and left/right actions for SHTL / JOG / SCRL, plus the
   general settings.
+- **Resolve.** Turn pass-through on or off and choose which keys to take over
+  inside Resolve (empty = native).
 
 Saving keeps the comments and layout of your config file. If bmdkey is
 running, the change applies immediately. The GUI expects the `bmdkey` binary
@@ -210,7 +258,11 @@ Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `Waiting...` forever | Resolve is open, another bmdkey is running, or the udev rule is missing. |
+| `Waiting...` forever | Resolve was started first, another bmdkey is running, or the udev rules are missing. |
+| `Resolve pass-through off: can't open /dev/uhid` | Install `99-bmdkey.rules` and do the `uhid` steps under *Permissions*; `getfacl /dev/uhid` must list your user. Log out and back in if it doesn't. |
+| `Unable to locate package libhidapi-dev` | Type the install command on one line (copied indentation can add invisible characters), or run `sudo apt update` first. |
+| Resolve doesn't see the Speed Editor | Start bmdkey first, then Resolve. Check the log for `Virtual Speed Editor ready`. |
+| `Resolve connected` but no `Resolve unlocked the Speed Editor` | Run `./bmdkey --learn --trace` and open an issue with the output. |
 | Keys do nothing in one app | Check the mapping with `--learn`. Some apps ignore synthetic events for F13–F24, so try another key. |
 | `LED update failed` in the log | Harmless; please open an issue. The mode lights on SHTL/JOG/SCRL are the least-tested part. |
 | Config changes ignored | Make sure you're editing the file named in the `Loaded ...` line. Running under `sudo` uses `/root/.config`. |
@@ -228,6 +280,8 @@ Changes from upstream
   AUDIO LEVEL (`0x2c`) and never worked.
 - Reconnects after the device is unplugged instead of crashing.
 - `bdm_gui.py`: log view, mapping editor, path no longer hard-coded.
+- DaVinci Resolve pass-through through a virtual (uhid) Speed Editor, with
+  `[resolve.keys]` to take over individual keys inside Resolve.
 
 Credits
 -------

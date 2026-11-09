@@ -29,6 +29,11 @@
 #
 # SHTL, JOG and SCRL are reserved: they switch the wheel between the three
 # [wheel.*] sections below, and light up to show which one is active.
+#
+# DAVINCI RESOLVE: while Resolve is running, bmdkey hands it a virtual Speed
+# Editor, so the keys, wheel and lights work natively in Resolve. [keys] and
+# [wheel.*] are then ignored; only keys listed in [resolve.keys] are taken
+# over. Start bmdkey before Resolve.
 
 [general]
 # Wheel mode at startup: jog, shtl or scrl
@@ -37,6 +42,9 @@ default_mode = jog
 key_leds = on
 # Pause between the steps of a sequence, in milliseconds
 sequence_delay_ms = 10
+# Pass the Speed Editor through to DaVinci Resolve (needs the udev rules;
+# takes effect when bmdkey restarts)
+resolve_passthrough = on
 
 [keys]
 SMART_INSRT  = F1
@@ -99,3 +107,9 @@ right = Right
 step  = 6000
 left  = scroll_up
 right = scroll_down
+
+# Keys to take over inside DaVinci Resolve. Anything not listed here keeps its
+# normal Resolve function. Same action syntax as [keys]. Examples:
+[resolve.keys]
+# CAM9      = ctrl+shift+F9
+# SYNC_BIN  = exec:notify-send "Sync bin pressed"
